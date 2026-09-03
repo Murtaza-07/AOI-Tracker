@@ -615,9 +615,14 @@ const GAMES_SEED = ["Azur Lane","Banjo-Kazooie: Nuts & Bolts","Blur","The Coffin
 
 const LEDGER_CONFIG = Object.freeze({...((window.LEDGER_CONFIG&&typeof window.LEDGER_CONFIG==='object')?window.LEDGER_CONFIG:{})});
 const ANILIST_AUTH_KEY = 'the_ledger_anilist_auth_v1';
+const GITHUB_SYNC_TOKEN_KEY = 'the_ledger_github_token_v1';
 const APP = Object.freeze({
   name: 'The Ledger', schema: 13, dbName: 'the_ledger_pro', dbVersion: 1,
-  stateKey: 'application-state', legacyKey: 'ledger_state_v2', fallbackKey: 'ledger_pro_state_v6',
+  stateKey: 'application-state',
+  // IndexedDB (via LedgerDB) is the real store. This localStorage key is just a mirror
+  // of the same JSON, written on every save purely so the browser's native 'storage'
+  // event fires — that's how a second open tab finds out this one just changed the data.
+  crossTabKey: 'ledger_pro_state_v6',
   media: ['anime','manga','games','movies'], historyLimit: 35, activityLimit: 600,
   backupIntervalMs: 86_400_000, cacheVersion: 5
 });
@@ -878,7 +883,7 @@ class LedgerDB {
 }
 
 class Store {
-  constructor(db){ this.db=db; this.state=null; this.undoStack=[]; this.redoStack=[]; this.persistDebounced=debounce(()=>this.persist(),140); }
+  constructor(db){ this.db=db; this.state=null; this.undoStack=[]; this.redoStack=[]; this.persistDebounced=debounce(()=>this.persist(),140); this.onChange=null; }
   seed(){
     const created=nowISO();
     const anime=ANIME_SEED.map(a=>this.normalizeEntry({id:`anilist-${a.id}`,title:a.title,status:a.status,score:a.score,source:{provider:'anilist',id:String(a.id)},addedAt:created,updatedAt:created},'anime'));
@@ -887,27 +892,22 @@ class Store {
       schema:APP.schema, revision:1, updatedAt:created,
       profile:{ title:'The Ledger', subtitle:'Anime · Manga · Games · Movies', targetDate:'2034-01-12' },
       goals:{anime:1000,manga:1000,games:1000,movies:1000},
-      settings:{theme:'system',density:'comfortable',libraryView:'grid',pageSize:120,activeMedium:'anime',defaultView:'library',appearance:normalizeAppearance(),apiKeys:{rawg:'',tmdb:''},anilist:{clientId:String(LEDGER_CONFIG.anilistClientId||''),autoPush:false},autoBackup:true,includeKeysInExport:false},
+      settings:{theme:'system',density:'comfortable',libraryView:'grid',pageSize:120,activeMedium:'anime',defaultView:'library',appearance:normalizeAppearance(),apiKeys:{rawg:'',tmdb:''},anilist:{clientId:String(LEDGER_CONFIG.anilistClientId||''),autoPush:false},githubSync:{owner:'',repo:'',path:'ledger.json',branch:'main',autoSync:false,sha:null,lastSyncAt:null},autoBackup:true,includeKeysInExport:false},
       collections:{anime,manga:[],games,movies:[]}, activity:[], trash:[], lastBackupAt:null
     };
   }
   normalizeEntry(raw,medium){
     const meta=MEDIUM[medium], date=raw.updatedAt||raw.addedAt||nowISO();
     let source=raw.source&&typeof raw.source==='object'?{...raw.source}:null;
-    // Recover provider metadata lost by the original Ledger v2 migration.
-    // Legacy anime records used ids such as `mal-173172` / `malId`, but the bundled
-    // seed values correspond to this Ledger's AniList catalogue. Chrome users who
-    // already had v2 data therefore ended up with source=null, preventing hydration.
+    // Older saved entries may carry a MyAnimeList-style id (`mal-173172` / `malId`) instead
+    // of an AniList source. If the title matches the bundled seed list, reattach the AniList
+    // id so covers and metadata can still be refreshed for that entry.
     if(medium==='anime'&&!source){
       const legacyId=String(raw.malId||String(raw.id||'').match(/^mal-(\d+)$/)?.[1]||'');
       if(legacyId&&ANILIST_SEED_BY_ID.get(legacyId)===String(raw.title||'').trim())source={provider:'anilist',id:legacyId};
     }
     if(medium==='anime'&&source?.provider==='jikan'&&ANILIST_SEED_BY_ID.get(String(source.id))===String(raw.title||'').trim())source={provider:'anilist',id:String(source.id)};
     let image=safeImage(raw.image||''),metadata=raw.metadata&&typeof raw.metadata==='object'?{...raw.metadata}:{},year=raw.year?clamp(raw.year,1000,9999):null;
-    if(medium==='games'&&titleKey(raw.title)==='dispatch'){
-      const cover='https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2592160/6754ae9d2f555ee1cf37f9d44021d34554d9991d/library_600x900_2x.jpg';
-      image=safeImage(cover);year=2025;source={provider:'steam-canonical',id:'2592160'};metadata={...metadata,resolverVersion:6,identityPinned:true,identityReason:'Dispatch · AdHoc Studio · Steam 2592160',steamAppId:'2592160',releaseDate:'2025-10-22',developers:['AdHoc Studio'],publishers:['AdHoc Studio'],steamUrl:'https://store.steampowered.com/app/2592160/Dispatch/',coverCandidates:uniq([cover,...(metadata.coverCandidates||[])]),confidence:'verified'};
-    }
     return {
       id:String(raw.id||uid(medium)), medium, title:String(raw.title||'Untitled').trim().slice(0,500), altTitle:String(raw.altTitle||'').slice(0,500),
       status:meta.statuses.includes(raw.status)?raw.status:meta.statuses[0], score:raw.score===''||raw.score==null?null:clamp(raw.score,0,100),
@@ -927,7 +927,7 @@ class Store {
       base.activity.unshift({id:uid('act'),type:'migration',detail:'Imported legacy Ledger v2 data',at:nowISO()});
       return base;
     }
-    const merged={...base,...raw,profile:{...base.profile,...raw.profile},goals:{...base.goals,...raw.goals},settings:{...base.settings,...raw.settings,appearance:normalizeAppearance({...base.settings.appearance,...raw.settings?.appearance}),apiKeys:{...base.settings.apiKeys,...raw.settings?.apiKeys},anilist:{...base.settings.anilist,...raw.settings?.anilist}},collections:{...base.collections,...raw.collections}};
+    const merged={...base,...raw,profile:{...base.profile,...raw.profile},goals:{...base.goals,...raw.goals},settings:{...base.settings,...raw.settings,appearance:normalizeAppearance({...base.settings.appearance,...raw.settings?.appearance}),apiKeys:{...base.settings.apiKeys,...raw.settings?.apiKeys},anilist:{...base.settings.anilist,...raw.settings?.anilist},githubSync:{...base.settings.githubSync,...raw.settings?.githubSync}},collections:{...base.collections,...raw.collections}};
     for(const m of APP.media) merged.collections[m]=(merged.collections[m]||[]).map(e=>this.normalizeEntry(e,m));
     merged.activity=Array.isArray(raw.activity)?raw.activity.slice(0,APP.activityLimit):[];
     merged.trash=Array.isArray(raw.trash)?raw.trash.slice(0,300):[];
@@ -938,12 +938,8 @@ class Store {
   }
   async load(){
     await this.db.open();
-    let raw=await this.db.get('state',APP.stateKey);
-    if(!raw){ try{ raw=JSON.parse(localStorage.getItem(APP.fallbackKey)||'null'); }catch{} }
-    if(!raw){ try{ raw=JSON.parse(localStorage.getItem(APP.legacyKey)||'null'); }catch{} }
+    const raw=await this.db.get('state',APP.stateKey);
     this.state=this.migrate(raw);
-    // Preserve keys from the original Ledger's separate key store.
-    try { const legacyKeys=JSON.parse(localStorage.getItem('ledger_keys')||'null'); if(legacyKeys){this.state.settings.apiKeys.rawg ||= legacyKeys.rawg||''; this.state.settings.apiKeys.tmdb ||= legacyKeys.tmdb||'';} } catch {}
     await this.persist();
     return this.state;
   }
@@ -953,6 +949,7 @@ class Store {
     mutator(this.state); this.state.revision=(this.state.revision||0)+1; this.state.updatedAt=nowISO();
     if(activity) this.log(activity.type,activity.title,activity.detail,activity.medium,activity.entryId);
     this.persistDebounced();
+    this.onChange?.();
   }
   log(type,title,detail='',medium='',entryId=''){
     this.state.activity.unshift({id:uid('act'),type,title,detail,medium,entryId,at:nowISO()});
@@ -961,16 +958,16 @@ class Store {
   async persist(){
     if(!this.state)return;
     const clean=deepClone(this.state);
-    try{ localStorage.setItem(APP.fallbackKey,JSON.stringify(clean)); }catch{}
+    try{ localStorage.setItem(APP.crossTabKey,JSON.stringify(clean)); }catch{}
     await this.db.put('state',clean,APP.stateKey);
   }
   undo(){
     if(!this.undoStack.length)return false;
-    this.redoStack.push(this.snapshot()); this.state=this.undoStack.pop(); this.log('undo','Undid last change'); this.persistDebounced(); return true;
+    this.redoStack.push(this.snapshot()); this.state=this.undoStack.pop(); this.log('undo','Undid last change'); this.persistDebounced(); this.onChange?.(); return true;
   }
   redo(){
     if(!this.redoStack.length)return false;
-    this.undoStack.push(this.snapshot()); this.state=this.redoStack.pop(); this.log('redo','Redid last change'); this.persistDebounced(); return true;
+    this.undoStack.push(this.snapshot()); this.state=this.redoStack.pop(); this.log('redo','Redid last change'); this.persistDebounced(); this.onChange?.(); return true;
   }
   async backup(reason='automatic'){
     const backup={id:`${Date.now()}-${reason}`,at:nowISO(),reason,schema:APP.schema,state:deepClone(this.state)};
@@ -978,6 +975,95 @@ class Store {
     const all=(await this.db.all('backups')).sort((a,b)=>b.at.localeCompare(a.at));
     for(const stale of all.slice(12)) await this.db.del('backups',stale.id);
     return backup;
+  }
+}
+
+// Durable off-browser storage for a single-user static site: a private GitHub repo,
+// talked to directly from the client via the Contents API. IndexedDB (via Store)
+// stays the fast local copy the UI actually reads and writes; this class just keeps
+// a JSON snapshot of that state in sync with one file in that repo, so the ledger
+// survives a cleared browser, a dead laptop, or a second device. Free for as long
+// as GitHub is, versioned automatically (every sync is a commit), and the file can
+// always be opened and hand-edited at github.com if something ever needs fixing.
+class GitHubSync {
+  constructor(store){
+    this.store = store;
+    this.syncing = false;
+    this.pendingResync = false;
+    this.debounceTimer = null;
+  }
+  get settings(){ return this.store.state?.settings?.githubSync || {}; }
+  get token(){
+    try { return localStorage.getItem(GITHUB_SYNC_TOKEN_KEY) || ''; }
+    catch { return ''; }
+  }
+  setToken(value){
+    try { value ? localStorage.setItem(GITHUB_SYNC_TOKEN_KEY, value) : localStorage.removeItem(GITHUB_SYNC_TOKEN_KEY); }
+    catch { /* localStorage unavailable — sync will just fail loudly when attempted */ }
+  }
+  configured(){
+    const s = this.settings;
+    return Boolean(s.owner && s.repo && s.path && this.token);
+  }
+  contentsUrl(){
+    const s = this.settings, path = s.path.split('/').filter(Boolean).map(encodeURIComponent).join('/');
+    return `https://api.github.com/repos/${encodeURIComponent(s.owner)}/${encodeURIComponent(s.repo)}/contents/${path}`;
+  }
+  headers(){
+    return { Authorization:`Bearer ${this.token}`, Accept:'application/vnd.github+json', 'X-GitHub-Api-Version':'2022-11-28' };
+  }
+  // Reads the file straight from the repo. Returns null if it doesn't exist yet
+  // (first sync ever) rather than throwing, since that's a normal starting state.
+  async fetchRemote(){
+    const res = await fetch(`${this.contentsUrl()}?ref=${encodeURIComponent(this.settings.branch || 'main')}`, { headers:this.headers() });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`GitHub read failed (HTTP ${res.status})`);
+    const json = await res.json();
+    const text = decodeURIComponent(escape(atob(json.content.replace(/\n/g, ''))));
+    return { sha:json.sha, state:JSON.parse(text) };
+  }
+  async writeRemote(stateSnapshot){
+    const body = {
+      message: `Ledger sync ${new Date().toISOString()}`,
+      content: btoa(unescape(encodeURIComponent(JSON.stringify(stateSnapshot, null, 2)))),
+      branch: this.settings.branch || 'main'
+    };
+    if (this.settings.sha) body.sha = this.settings.sha;
+    const res = await fetch(this.contentsUrl(), { method:'PUT', headers:this.headers(), body:JSON.stringify(body) });
+    if (res.status === 409) throw Object.assign(new Error('The file on GitHub changed since the last sync — pull it in before pushing again'), { conflict:true });
+    if (!res.ok) throw new Error(`GitHub write failed (HTTP ${res.status})`);
+    const json = await res.json();
+    return json.content.sha;
+  }
+  // Called after every store mutation. Only actually does anything if the person
+  // has turned auto-sync on; otherwise "Sync now" in Settings is the only trigger.
+  queueAutoSync(){
+    if (!this.configured() || !this.settings.autoSync) return;
+    clearTimeout(this.debounceTimer);
+    this.debounceTimer = setTimeout(() => { this.syncNow().catch(err => console.warn('GitHub auto-sync failed', err)); }, 4000);
+  }
+  async syncNow(){
+    if (!this.configured()) throw new Error('Add a repo, path and token in Settings first');
+    if (this.syncing) { this.pendingResync = true; return; }
+    this.syncing = true;
+    try {
+      const sha = await this.writeRemote(this.store.state);
+      this.store.state.settings.githubSync.sha = sha;
+      this.store.state.settings.githubSync.lastSyncAt = nowISO();
+      await this.store.persist();
+    } finally {
+      this.syncing = false;
+      if (this.pendingResync) { this.pendingResync = false; this.syncNow().catch(() => {}); }
+    }
+  }
+  // Pulls the remote file and hands back its state, or null if nothing's been
+  // pushed yet. Also remembers the sha so the next syncNow() updates cleanly
+  // instead of colliding with what's already there.
+  async pullLatest(){
+    const remote = await this.fetchRemote();
+    if (!remote) return null;
+    this.store.state.settings.githubSync.sha = remote.sha;
+    return remote.state;
   }
 }
 
@@ -1077,15 +1163,6 @@ class APIClient {
     const id=String(appId||'').match(/^\d+$/)?.[0];
     if(!id)return '';
     return `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${id}/${scale==='1x'?'library_600x900.jpg':'library_600x900_2x.jpg'}`;
-  }
-  dispatchCanonicalRecord(base=null){
-    const officialCover='https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2592160/6754ae9d2f555ee1cf37f9d44021d34554d9991d/library_600x900_2x.jpg';
-    const genericCover=this.steamPortrait('2592160','2x'),fallback=this.steamPortrait('2592160','1x');
-    const record=base?deepClone(base):{id:'steam-2592160',title:'Dispatch',year:2025,genres:['Adventure','Strategy'],source:{provider:'steam-canonical',id:'2592160'},metadata:{}};
-    record.id=record.id||'steam-2592160'; record.title='Dispatch'; record.year=2025; record.image=safeImage(officialCover); record.fallbackImage=safeImage(genericCover||fallback);
-    record.source=record.source||{provider:'steam-canonical',id:'2592160'};
-    const md=record.metadata||{}; record.metadata={...md,provider:md.provider||'lizardbyte-gamedb',resolverVersion:6,identityPinned:true,identityReason:'Dispatch · AdHoc Studio · Steam 2592160',steamAppId:'2592160',releaseDate:'2025-10-22',developers:['AdHoc Studio'],publishers:['AdHoc Studio'],platforms:uniq([...(md.platforms||[]),'Windows','PlayStation 5','Nintendo Switch','Nintendo Switch 2','Xbox Series X/S']),officialWebsite:md.officialWebsite||'https://www.adhocla.com/',steamUrl:'https://store.steampowered.com/app/2592160/Dispatch/',wikipediaUrl:md.wikipediaUrl||'https://en.wikipedia.org/wiki/Dispatch_(video_game)',coverOptions:[{url:safeImage(officialCover),label:'Steam official library cover',kind:'store'},...(md.coverOptions||[]).filter(x=>safeImage(x?.url)!==safeImage(officialCover))],coverCandidates:uniq([officialCover,genericCover,fallback,...(md.coverCandidates||[])].map(safeImage).filter(Boolean)),coverFallback:safeImage(genericCover||fallback),confidence:'verified',matchScore:9999,searchScore:9999,exactTitleMatch:true,resolvedAt:nowISO()};
-    record.meta='2025 · AdHoc Studio · verified'; return record;
   }
   async wikipediaSearchRaw(query,limit=12){
     const url=this.wikipediaURL({action:'query',list:'search',srsearch:`\"${query.trim()}\" video game`,srnamespace:'0',srlimit:String(limit),utf8:'1'});
@@ -1261,13 +1338,6 @@ class APIClient {
     const text=String(value).trim(); const d=new Date(text); if(!Number.isNaN(d.getTime()))return d.toISOString().slice(0,10);
     const y=text.match(/(?:19|20)\d{2}/)?.[0];return y||null;
   }
-  gameSearchHint(query){
-    const q=norm(query).replace(/[^a-z0-9\p{L}\p{N}]+/gu,' ').replace(/\s+/g,' ').trim();
-    if(['arena ultimax','p4au','persona 4 arena ultimax'].includes(q))return {canonical:'Persona 4 Arena Ultimax'};
-    if(q==='dispatch')return {preferredDeveloper:'AdHoc Studio',preferredYear:2025,preferredSteamAppId:'2592160'};
-    if(['vallhalla','valhalla','va 11 hall a','va11 halla','va 11 halla','va11 hall a','va 11 hall a cyberpunk bartender action'].includes(q))return {canonical:'VA-11 Hall-A: Cyberpunk Bartender Action',preferredDeveloper:'Sukeban Games'};
-    return {};
-  }
   gameTitleScore(query,title,aliases=[]){
     const clean=v=>norm(v).replace(/[^a-z0-9\p{L}\p{N}]+/gu,' ').replace(/\s+/g,' ').trim();
     const q=clean(query);if(!q)return 0;
@@ -1288,12 +1358,8 @@ class APIClient {
     let best=scoreOne(title);for(const alias of aliases||[])best=Math.max(best,scoreOne(alias)-8);return best;
   }
   gameRecordRelevance(query,record,platformFilter=''){
-    if(!record)return -Infinity;const md=record.metadata||{},hint=this.gameSearchHint(query),devs=(md.developers||[]).map(norm),platforms=(md.platforms||[]).map(norm);
+    if(!record)return -Infinity;const md=record.metadata||{},devs=(md.developers||[]).map(norm),platforms=(md.platforms||[]).map(norm);
     let score=Number(md.matchScore)||this.gameTitleScore(query,record.title,md.aliases||[]);
-    if(hint.canonical&&titleKey(record.title)===titleKey(hint.canonical))score+=1600;
-    if(hint.preferredDeveloper&&devs.some(x=>x.includes(norm(hint.preferredDeveloper))))score+=1800;
-    if(hint.preferredSteamAppId&&String(md.steamAppId||'')===String(hint.preferredSteamAppId))score+=2600;
-    if(hint.preferredYear&&Number(record.year||String(md.releaseDate||'').slice(0,4))===Number(hint.preferredYear))score+=450;
     if(platformFilter){const target=norm(platformFilter),match=platforms.some(p=>p===target||p.includes(target)||target.includes(p));score+=match?500:-2400;}
     const type=norm(md.gameType||'');if(/main game|main_game|game/.test(type)&&!/dlc|addon|expansion|bundle|mod|episode|season|pack/.test(type))score+=110;
     if(/dlc|addon|expansion|bundle|mod|episode|season pass|pack/.test(type))score-=300;
@@ -1370,8 +1436,8 @@ class APIClient {
     return record;
   }
   async searchGameDb(query,limit=12,platformFilter=''){
-    const hint=this.gameSearchHint(query),lookupQuery=hint.canonical||query,bucket=await this.gameDbBucket(lookupQuery),items=Object.entries(bucket||{}).map(([id,v])=>({id,name:String(v?.name||v?.title||v||'')})).filter(x=>x.name);
-    items.forEach(x=>x.score=Math.max(this.gameTitleScore(query,x.name),hint.canonical?this.gameTitleScore(hint.canonical,x.name):0));items.sort((a,b)=>b.score-a.score||a.name.localeCompare(b.name));
+    const bucket=await this.gameDbBucket(query),items=Object.entries(bucket||{}).map(([id,v])=>({id,name:String(v?.name||v?.title||v||'')})).filter(x=>x.name);
+    items.forEach(x=>x.score=this.gameTitleScore(query,x.name));items.sort((a,b)=>b.score-a.score||a.name.localeCompare(b.name));
     const exact=items.filter(x=>x.score>=970).slice(0,10),seen=new Set(exact.map(x=>x.id)),candidates=[...exact,...items.filter(x=>x.score>100&&!seen.has(x.id)).slice(0,exact.length?6:10)];
     const resolved=await Promise.all(candidates.map(async hit=>{try{const r=this.gameDbRecord(query,hit.id,await this.gameDbGame(hit.id),hit.name);if(r)this.gameRecordRelevance(query,r,platformFilter);return r;}catch{return null;}}));
     let out=resolved.filter(Boolean).sort((a,b)=>(b.metadata?.searchScore||0)-(a.metadata?.searchScore||0)||(b.metadata?.matchScore||0)-(a.metadata?.matchScore||0));
@@ -1406,15 +1472,9 @@ class APIClient {
     }));return upgraded;
   }
   async searchGames(query,limit=12,platformFilter=''){
-    const hint=this.gameSearchHint(query),multiWord=query.trim().split(/\s+/).length>1;
-    if(titleKey(query)==='dispatch'){
-      let db=[];try{db=await this.searchGameDb('Dispatch',Math.max(8,limit),platformFilter);}catch{}
-      const adhoc=db.find(r=>String(r.metadata?.steamAppId||'')==='2592160'||(r.metadata?.developers||[]).some(d=>norm(d).includes('adhoc studio'))),fixed=this.dispatchCanonicalRecord(adhoc||null);
-      const rest=db.filter(r=>r!==adhoc&&titleKey(r.title)!=='dispatch').sort((a,b)=>this.gameRecordRelevance(query,b,platformFilter)-this.gameRecordRelevance(query,a,platformFilter));
-      return [fixed,...rest].slice(0,limit);
-    }
-    // Start suffix/alias discovery in parallel so a query like "arena ultimax" does not pay a second full round trip.
-    const discoveryPromise=(multiWord&&!hint.canonical)?this.searchGamesLegacy(query,Math.min(8,limit)).catch(()=>[]):null;
+    const multiWord=query.trim().split(/\s+/).length>1;
+    // Start suffix/alias discovery in parallel so a multi-word query does not pay a second full round trip.
+    const discoveryPromise=multiWord?this.searchGamesLegacy(query,Math.min(8,limit)).catch(()=>[]):null;
     let primary=[];try{primary=await this.searchGameDb(query,limit,platformFilter);}catch(error){console.warn('GameDB primary search unavailable, using fallback',error);}
     const top=primary[0],topScore=top?.metadata?.searchScore||0,topTitleScore=top?.metadata?.matchScore||0;
     if(top&&topTitleScore>=970&&topScore>=980)return primary.slice(0,limit);
@@ -1426,7 +1486,6 @@ class APIClient {
   async resolveGamesBatch(entries){
     const list=(entries||[]).filter(Boolean).slice(0,8),out=new Map();
     const resolved=await Promise.all(list.map(async entry=>{
-      if(titleKey(entry.title)==='dispatch'){const fixed=(await this.searchGames('Dispatch',3).catch(()=>[]))[0]||this.dispatchCanonicalRecord();return {entry,best:fixed};}
       const direct=await this.gameDbDirectRecord(entry);if(direct)return {entry,best:direct};
       if(entry.source?.provider==='wikidata'&&/^Q\d+$/.test(String(entry.source.id||''))){
         const existing=await this.buildGameResults(entry.title,[{id:String(entry.source.id),label:entry.title,description:''}],3).catch(()=>[]),legacy=existing[0];
@@ -1484,8 +1543,8 @@ class APIClient {
 }
 
 class LedgerApp {
-  constructor(store,api){
-    this.store=store; this.api=api; this.ui={view:'library',medium:'anime',query:'',status:'ALL',sort:'updated-desc',favorite:false,minScore:'',tag:'',year:'',platform:'',advanced:false,visible:120,selection:new Set(),editingId:null,editingMedium:null,entryInitial:null,searchTimer:null};
+  constructor(store,api,cloudSync){
+    this.store=store; this.api=api; this.cloudSync=cloudSync; this.ui={view:'library',medium:'anime',query:'',status:'ALL',sort:'updated-desc',favorite:false,minScore:'',tag:'',year:'',platform:'',advanced:false,visible:120,selection:new Set(),editingId:null,editingMedium:null,entryInitial:null,searchTimer:null};
     this.coverObserver=null; this.coverQueue=[]; this.coverQueued=new Set(); this.coverWorkerRunning=false; this.coverRenderToken=0;
     this.commands=[
       {label:'Add a new entry',hint:'N',run:()=>this.openAdd()},
@@ -1505,9 +1564,34 @@ class LedgerApp {
   async init(){
     await this.store.load();
     await this.captureAniListOAuth();
+    await this.reconcileCloudSync();
     this.ui.medium=this.state.settings.activeMedium||'anime'; this.ui.view=this.state.settings.defaultView||'library'; this.ui.visible=this.state.settings.pageSize||120;
     this.applyAppearance(); this.bind(); this.updateNetworkStatus(); this.render(); this.autoBackup();
     if(this.getAniListAuth()?.accessToken&&!this.getAniListAuth()?.viewer)this.verifyAniListConnection({quiet:true}).catch(()=>{});
+  }
+  // On startup, whichever copy was touched more recently — this browser's or the
+  // one sitting in GitHub — wins. That's enough for "one person, maybe two
+  // devices, not editing both at the exact same second," which is the real
+  // use case here. It is not a real multi-writer merge; two tabs open at once
+  // will just have the later save clobber the earlier one, same as any other
+  // last-write-wins sync.
+  async reconcileCloudSync(){
+    if(!this.cloudSync.configured())return;
+    try{
+      const remote=await this.cloudSync.pullLatest();
+      if(!remote)return void this.cloudSync.syncNow().catch(()=>{});
+      if(!this.state.updatedAt||(remote.updatedAt&&remote.updatedAt>this.state.updatedAt)){
+        await this.store.backup('pre-cloud-pull');
+        this.store.state=this.store.migrate(remote);
+        await this.store.persist();
+        toast('Loaded the newer copy from GitHub sync');
+      }else{
+        this.cloudSync.syncNow().catch(()=>{});
+      }
+    }catch(err){
+      console.warn('GitHub sync check failed',err);
+      toast(`GitHub sync check failed: ${err.message}`,'',null,6500);
+    }
   }
   bind(){
     document.addEventListener('click',e=>this.onClick(e));
@@ -1519,7 +1603,7 @@ class LedgerApp {
     $('#import-file').addEventListener('change',e=>this.importFile(e.target.files?.[0]));
     $('#manga-import-file').addEventListener('change',e=>this.importMangaFile(e.target.files?.[0]));
     $('#transfer-file').addEventListener('change',e=>this.importTransferFile(e.target.files?.[0]));
-    window.addEventListener('storage',e=>{if(e.key===APP.fallbackKey)toast('Ledger changed in another tab. Reload to merge safely.','Reload',()=>location.reload(),10000);});
+    window.addEventListener('storage',e=>{if(e.key===APP.crossTabKey)toast('Ledger changed in another tab. Reload to merge safely.','Reload',()=>location.reload(),10000);});
     window.addEventListener('beforeunload',()=>this.store.persist()); window.addEventListener('online',()=>this.updateNetworkStatus()); window.addEventListener('offline',()=>this.updateNetworkStatus()); matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change',()=>{if(this.state?.settings?.theme==='system')this.applyAppearance();});
   }
   onClick(e){
@@ -1536,6 +1620,7 @@ class LedgerApp {
         'import':()=>$('#import-file').click(),'create-backup':()=>this.createBackup(),'restore-backup':()=>this.restoreBackup(),
         'dedupe':()=>this.dedupe(),'clear-cache':()=>this.clearCache(),'reset-app':()=>this.resetApp(),'clear-activity':()=>this.clearActivity(),
         'save-settings':()=>this.saveSettings(),'hydrate-covers':()=>this.backfillCovers(),'warm-games':()=>this.warmGames(),'show-shortcuts':()=>this.showShortcuts(),'anilist-connect':()=>this.connectAniList(),'anilist-disconnect':()=>this.disconnectAniList(),'anilist-verify':()=>this.verifyAniListConnection(),'anilist-pull':()=>this.pullAniList(),'anilist-push':()=>this.pushAllAniList(),'anilist-sync-entry':()=>this.syncEditingAniList(),
+        'github-sync-now':()=>this.githubSyncNow(),'github-pull-now':()=>this.githubPullNow(),
         'open-manga-import':()=>this.openMangaImport(),'choose-manga-import':()=>$('#manga-import-file').click(),'import-manga-text':()=>this.importMangaText(),'refresh-game':()=>this.refreshEditingGame(),'reset-colors':()=>{const a=normalizeAppearance();if($('#set-accent'))$('#set-accent').value=a.accent;if($('#set-tone-style'))$('#set-tone-style').value=a.toneStyle;if($('#set-radius'))$('#set-radius').value=a.radius;for(const m of APP.media){const el=$(`#set-color-${m}`);if(el)el.value=a.mediumColors[m];}this.previewAppearance();}
       };
       if(map[action]){e.preventDefault();map[action]();return;}
@@ -1929,20 +2014,20 @@ class LedgerApp {
   clearActivity(){if(!confirm('Clear the activity log? This does not delete collection data.'))return;this.store.commit(s=>s.activity=[],null);this.renderActivity();}
 
   async warmGames(){
-    const pending=this.state.collections.games.filter(e=>!e.image||(!e.metadata?.identityPinned&&e.source?.provider!=='lizardbyte-gamedb')||Number(e.metadata?.resolverVersion||0)<6);
+    const pending=this.state.collections.games.filter(e=>!e.image||e.source?.provider!=='lizardbyte-gamedb'||Number(e.metadata?.resolverVersion||0)<6);
     if(!pending.length){toast('Game metadata is already warm');return;}
     toast(`Warming ${pending.length} game entr${pending.length===1?'y':'ies'}…`);
     let resolvedCount=0;
     for(let i=0;i<pending.length;i+=8){
       const batch=pending.slice(i,i+8), resolved=await this.api.resolveGamesBatch(batch).catch(()=>new Map());
-      for(const entry of batch){const game=resolved.get(entry.id);if(!game)continue;const oldVersion=Number(entry.metadata?.resolverVersion||0);entry.source=game.source;if(!entry.image||oldVersion<6||game.metadata?.identityPinned)entry.image=safeImage(game.image||entry.image||'');entry.year=game.metadata?.identityPinned?game.year:(entry.year||game.year);if(game.metadata?.identityPinned||!entry.genres.length)entry.genres=game.genres||entry.genres||[];entry.metadata={...entry.metadata,...game.metadata};entry.updatedAt=nowISO();resolvedCount++;}
+      for(const entry of batch){const game=resolved.get(entry.id);if(!game)continue;const oldVersion=Number(entry.metadata?.resolverVersion||0);entry.source=game.source;if(!entry.image||oldVersion<6)entry.image=safeImage(game.image||entry.image||'');entry.year=entry.year||game.year;if(!entry.genres.length)entry.genres=game.genres||entry.genres||[];entry.metadata={...entry.metadata,...game.metadata};entry.updatedAt=nowISO();resolvedCount++;}
       this.store.persistDebounced(); if(this.ui.medium==='games'&&this.ui.view==='library')this.renderCollection(); await sleep(100);
     }
     toast(`Resolved ${resolvedCount} of ${pending.length} games`);
   }
 
   renderSettings(){
-    if(!this.state)return;const s=this.state.settings,p=this.state.profile,alAuth=this.getAniListAuth(),alClient=this.anilistClientId(),alName=alAuth?.viewer?.name||'';
+    if(!this.state)return;const s=this.state.settings,p=this.state.profile,alAuth=this.getAniListAuth(),alClient=this.anilistClientId(),alName=alAuth?.viewer?.name||'',gh=s.githubSync||{};
     $('#settings-content').innerHTML=`<div class="settings-grid">
       <div class="settings-intro"><div class="settings-intro-icon">✦</div><div><strong>Make Ledger feel like yours</strong><p>Choose a color and tonal style first. Everything else stays tucked away until you need it.</p></div></div>
 
@@ -1974,6 +2059,16 @@ class LedgerApp {
 
       <details class="settings-section"><summary class="settings-summary"><span class="settings-summary-icon">⇩</span><span class="settings-summary-copy"><h3>Data & backups</h3><p>Portable formats, snapshots and duplicate cleanup.</p></span><span class="settings-chevron">⌄</span></summary><div class="settings-body"><div class="data-actions"><button class="btn primary" data-action="open-transfer">Open transfer center</button><button class="btn" data-action="export-json">Quick JSON backup</button><button class="btn" data-action="open-manga-import">Quick manga import</button><button class="btn" data-action="create-backup">Create browser snapshot</button><button class="btn" data-action="restore-backup">Restore latest snapshot</button><button class="btn" data-action="dedupe">Find duplicates</button></div><div class="format-pill-row" style="margin-top:9px"><span class="format-pill">Ledger JSON</span><span class="format-pill">Universal CSV</span><span class="format-pill">MAL XML</span><span class="format-pill">Letterboxd CSV</span><span class="format-pill">IMDb CSV</span><span class="format-pill">TXT</span></div><label class="check-row" style="margin-top:9px"><input type="checkbox" id="set-auto-backup" ${s.autoBackup?'checked':''}> Create rotating browser backups automatically</label><div class="api-note">Last automatic snapshot: ${escapeHtml(this.state.lastBackupAt?`${fmtDate(this.state.lastBackupAt)} (${fmtRelative(this.state.lastBackupAt)})`:'none yet')} · schema v${APP.schema} · revision ${this.state.revision}</div></div></details>
 
+      <details class="settings-section"><summary class="settings-summary"><span class="settings-summary-icon">☁</span><span class="settings-summary-copy"><h3>Cloud sync (GitHub)</h3><p>Keeps a versioned copy of your ledger in a private repo you own, so it survives more than this one browser.</p></span><span class="settings-chevron">⌄</span></summary><div class="settings-body">
+        <div class="api-note">Make a private repo for the data (separate from the one hosting this page), then a fine-grained personal access token scoped to just that repo with "Contents: Read and write". The token is saved only in this browser's local storage — it is never written into JSON exports.</div>
+        <div class="form-grid"><div class="field-group"><label for="set-gh-owner">GitHub username</label><input class="field" id="set-gh-owner" value="${escapeHtml(gh.owner||'')}" placeholder="yourusername" autocomplete="off"></div><div class="field-group"><label for="set-gh-repo">Data repo</label><input class="field" id="set-gh-repo" value="${escapeHtml(gh.repo||'')}" placeholder="ledger-data" autocomplete="off"></div></div>
+        <div class="form-grid"><div class="field-group"><label for="set-gh-path">File path</label><input class="field" id="set-gh-path" value="${escapeHtml(gh.path||'ledger.json')}" autocomplete="off"></div><div class="field-group"><label for="set-gh-branch">Branch</label><input class="field" id="set-gh-branch" value="${escapeHtml(gh.branch||'main')}" autocomplete="off"></div></div>
+        <div class="field-group"><label for="set-gh-token">Personal access token</label><input class="field" id="set-gh-token" type="password" autocomplete="off" placeholder="${this.cloudSync.token?'Saved · leave blank to keep it':'github_pat_… or ghp_…'}"></div>
+        <label class="check-row"><input type="checkbox" id="set-gh-auto" ${gh.autoSync?'checked':''}> Sync automatically a few seconds after each change</label>
+        <div class="data-actions" style="margin-top:9px"><button class="btn" data-action="github-sync-now" ${this.cloudSync.configured()?'':'disabled'}>Sync now</button><button class="btn" data-action="github-pull-now" ${this.cloudSync.configured()?'':'disabled'}>Pull from GitHub</button></div>
+        <div class="api-note" style="margin-top:8px">${gh.lastSyncAt?`Last synced ${fmtRelative(gh.lastSyncAt)}`:'Not synced yet · save settings below once the fields above are filled in, then Sync now.'}</div>
+      </div></details>
+
       <details class="settings-section danger-zone"><summary class="settings-summary"><span class="settings-summary-icon">!</span><span class="settings-summary-copy"><h3>Danger zone</h3><p>Destructive actions stay tucked away on purpose.</p></span><span class="settings-chevron">⌄</span></summary><div class="settings-body"><div class="api-note">Reset permanently removes Ledger data from this browser. Export a JSON backup first.</div><div><button class="btn danger" data-action="reset-app">Reset entire ledger</button></div></div></details>
 
       <div class="settings-savebar"><span class="save-hint">Theme previews are live. Save to keep all settings.</span><button class="btn" data-action="show-shortcuts">Shortcuts</button><button class="btn primary" data-action="save-settings">Save settings</button></div>
@@ -1982,8 +2077,28 @@ class LedgerApp {
   }
   saveSettings(){
     const title=$('#set-title').value.trim()||'The Ledger',target=$('#set-target-date').value;if(!target){toast('Choose a target date');return;}
-    this.store.commit(s=>{s.profile.title=title;s.profile.subtitle=$('#set-subtitle').value.trim();s.profile.targetDate=target;for(const m of APP.media)s.goals[m]=Math.max(1,Number($(`#goal-${m}`).value)||1000);s.settings.theme=$('#set-theme').value;s.settings.appearance=this.appearanceFromControls();s.settings.density=$('#set-density').value;s.settings.pageSize=Number($('#set-page-size').value)||120;s.settings.defaultView=$('#set-default-view').value;s.settings.autoBackup=$('#set-auto-backup').checked;s.settings.includeKeysInExport=$('#set-export-keys').checked;s.settings.apiKeys.tmdb=$('#set-tmdb').value.trim();s.settings.anilist=s.settings.anilist||{};if($('#set-anilist-client'))s.settings.anilist.clientId=$('#set-anilist-client').value.trim();s.settings.anilist.autoPush=Boolean($('#set-anilist-auto-push')?.checked);},{type:'settings',title:'Updated ledger settings'});
-    this.ui.visible=this.state.settings.pageSize;this.applyAppearance();this.renderHero();this.renderControls();this.renderCollection();this.renderDashboard();toast('Settings saved');
+    const ghToken=$('#set-gh-token')?.value.trim();if(ghToken)this.cloudSync.setToken(ghToken);
+    this.store.commit(s=>{s.profile.title=title;s.profile.subtitle=$('#set-subtitle').value.trim();s.profile.targetDate=target;for(const m of APP.media)s.goals[m]=Math.max(1,Number($(`#goal-${m}`).value)||1000);s.settings.theme=$('#set-theme').value;s.settings.appearance=this.appearanceFromControls();s.settings.density=$('#set-density').value;s.settings.pageSize=Number($('#set-page-size').value)||120;s.settings.defaultView=$('#set-default-view').value;s.settings.autoBackup=$('#set-auto-backup').checked;s.settings.includeKeysInExport=$('#set-export-keys').checked;s.settings.apiKeys.tmdb=$('#set-tmdb').value.trim();s.settings.anilist=s.settings.anilist||{};if($('#set-anilist-client'))s.settings.anilist.clientId=$('#set-anilist-client').value.trim();s.settings.anilist.autoPush=Boolean($('#set-anilist-auto-push')?.checked);s.settings.githubSync=s.settings.githubSync||{};s.settings.githubSync.owner=$('#set-gh-owner').value.trim();s.settings.githubSync.repo=$('#set-gh-repo').value.trim();s.settings.githubSync.path=$('#set-gh-path').value.trim()||'ledger.json';s.settings.githubSync.branch=$('#set-gh-branch').value.trim()||'main';s.settings.githubSync.autoSync=Boolean($('#set-gh-auto')?.checked);},{type:'settings',title:'Updated ledger settings'});
+    this.ui.visible=this.state.settings.pageSize;this.applyAppearance();this.renderHero();this.renderControls();this.renderCollection();this.renderDashboard();this.renderSettings();toast('Settings saved');
+  }
+  async githubSyncNow(){
+    if(!this.cloudSync.configured()){toast('Fill in the repo, path and token, then save settings first','',null,6000);return;}
+    toast('Syncing to GitHub…');
+    try{await this.cloudSync.syncNow();this.renderSettings();toast('Synced to GitHub');}
+    catch(err){toast(`GitHub sync failed: ${err.message}`,'',null,8000);}
+  }
+  async githubPullNow(){
+    if(!this.cloudSync.configured()){toast('Fill in the repo, path and token, then save settings first','',null,6000);return;}
+    if(!confirm('Replace the data in this browser with the latest version from GitHub? Current data will be snapshotted first.'))return;
+    try{
+      const remote=await this.cloudSync.pullLatest();
+      if(!remote){toast('Nothing on GitHub yet at that path — use Sync now to create it');return;}
+      await this.store.backup('pre-cloud-pull');
+      this.store.state=this.store.migrate(remote);
+      await this.store.persist();
+      this.render();
+      toast('Pulled the latest data from GitHub');
+    }catch(err){toast(`GitHub pull failed: ${err.message}`,'',null,8000);}
   }
 
   getAniListAuth(){
@@ -2198,7 +2313,7 @@ class LedgerApp {
     const dupes=[];for(const m of APP.media){const groups=new Map();for(const e of this.state.collections[m]){const k=titleKey(e.title);if(!groups.has(k))groups.set(k,[]);groups.get(k).push(e);}for(const g of groups.values())if(g.length>1)dupes.push({m,g});}
     if(!dupes.length){toast('No exact normalized-title duplicates found');return;}const detail=dupes.slice(0,20).map(d=>`${MEDIUM[d.m].label}: ${d.g.map(e=>e.title).join(' / ')}`).join('\n');alert(`Found ${dupes.length} duplicate group(s):\n\n${detail}${dupes.length>20?'\n…':''}`);
   }
-  async resetApp(){if(!confirm('This will erase the ledger from this browser. Continue?'))return;if(!confirm('Final confirmation: reset everything?'))return;await this.store.backup('pre-reset');localStorage.removeItem(APP.fallbackKey);localStorage.removeItem(APP.legacyKey);await this.store.db.clear('state');location.reload();}
+  async resetApp(){if(!confirm('This will erase the ledger from this browser. Continue?'))return;if(!confirm('Final confirmation: reset everything?'))return;await this.store.backup('pre-reset');localStorage.removeItem(APP.crossTabKey);await this.store.db.clear('state');location.reload();}
   async backfillCovers(){
     const missing=APP.media.slice(0,2).flatMap(m=>this.state.collections[m].filter(needsHDCover));if(!missing.length){toast('Anime and manga covers are already HD');return;}
     for(const entry of missing){const key=`${entry.medium}:${entry.id}`;if(this.coverQueued.has(key))continue;this.coverQueued.add(key);this.coverQueue.push({entryId:entry.id,medium:entry.medium,key,renderToken:this.coverRenderToken});}
@@ -2217,7 +2332,9 @@ class LedgerApp {
 const db=new LedgerDB();
 const store=new Store(db);
 const api=new APIClient(db,store);
-const ledger=new LedgerApp(store,api);
+const cloudSync=new GitHubSync(store);
+store.onChange=()=>cloudSync.queueAutoSync();
+const ledger=new LedgerApp(store,api,cloudSync);
 ledger.init().then(()=>materialColorReady.then(lib=>{if(lib){ledger.applyAppearance();if(ledger.ui.view==='settings')ledger.previewAppearance();}})).catch(err=>{console.error(err);document.body.innerHTML=`<main style="max-width:700px;margin:60px auto;padding:20px"><h1>The Ledger could not start</h1><p>${escapeHtml(err.message||String(err))}</p><p>Try reloading. Your existing local data has not been intentionally removed.</p></main>`;});
 if('serviceWorker' in navigator&&/^https?:$/.test(location.protocol))window.addEventListener('load',async()=>{
   try{
